@@ -1,15 +1,9 @@
-"""
-Phase 3 — Human Audit API
-Routes: GET /reviews, GET /reviews/{pr}, POST /reviews/{pr}/decision
-Secured with HTTP Bearer token.
-Applies patches to GitHub on "accept" / "modify".
-"""
-
 from __future__ import annotations
 
 import base64
 import json
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
@@ -23,6 +17,15 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
+structlog.configure(
+    processors=[
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        structlog.processors.JSONRenderer(),
+    ]
+)
 log = structlog.get_logger(__name__)
 
 GITHUB_TOKEN: str = os.environ["GITHUB_TOKEN"]
@@ -30,7 +33,7 @@ REVIEWER_TOKEN: str = os.environ["REVIEWER_TOKEN"]
 DB_PATH: str = os.environ.get("DB_PATH", "./data/reviews.db")
 GITHUB_API_BASE = "https://api.github.com"
 
-# ─── Auth ─────────────────────────────────────────────────────────────────────
+# Auth 
 
 _bearer_scheme = HTTPBearer()
 
@@ -44,7 +47,7 @@ def require_auth(credentials: HTTPAuthorizationCredentials = Security(_bearer_sc
     return credentials.credentials
 
 
-# ─── Pydantic v2 schemas ──────────────────────────────────────────────────────
+#  Pydantic v2 schemas 
 
 class SeveritySummary(BaseModel):
     HIGH: int = 0
@@ -77,13 +80,14 @@ class DecisionResponse(BaseModel):
     message: str
 
 
-# ─── DB helpers ───────────────────────────────────────────────────────────────
+# DB helpers 
 
 async def _list_awaiting_human() -> List[Dict[str, Any]]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT pr_number, repo, state_json, created_at FROM pr_reviews WHERE status = 'awaiting_human' ORDER BY created_at DESC"
+            "SELECT pr_number, repo, state_json, created_at FROM pr_reviews "
+            "WHERE status = 'awaiting_human' ORDER BY created_at DESC"
         ) as cur:
             return [dict(row) for row in await cur.fetchall()]
 
@@ -107,7 +111,7 @@ async def _mark_resolved(pr_number: int, state: Dict[str, Any]) -> None:
         await db.commit()
 
 
-# ─── GitHub helpers ───────────────────────────────────────────────────────────
+# GitHub helpers 
 
 def _gh_headers() -> dict:
     return {
@@ -130,105 +134,33 @@ async def _post_pr_comment(
     log.info("pr_comment_posted", pr_number=pr_number)
 
 
-async def _get_file_sha(
-    client: httpx.AsyncClient,
-    owner: str,
-    repo: str,
-    path: str,
-    ref: str,
-) -> Optional[str]:
-    """Get the blob SHA needed to update a file."""
-    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{path}"
-    resp = await client.get(url, params={"ref": ref}, headers=_gh_headers())
-    if resp.status_code == 404:
-        return None
-    resp.raise_for_status()
-    return resp.json().get("sha")
-
-
-async def _apply_patch_via_contents_api(
-    client: httpx.AsyncClient,
-    owner: str,
-    repo: str,
-    branch: str,
-    filename: str,
-    original_content: str,
-    patch_diff: str,
-    commit_message: str,
-) -> str:
-    """
-    Apply a unified diff patch by:
-    1. Parsing the diff to produce new file content
-    2. PUT /repos/{owner}/{repo}/contents/{path} to update the file
-    Returns the new commit SHA.
-    """
-    # Apply the patch manually (simple line-based application)
-    new_content = _apply_unified_diff(original_content, patch_diff)
-    encoded = base64.b64encode(new_content.encode("utf-8")).decode()
-
-    # Get current file blob SHA
-    file_sha = await _get_file_sha(client, owner, repo, filename, branch)
-
-    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{filename}"
-    payload: Dict[str, Any] = {
-        "message": commit_message,
-        "content": encoded,
-        "branch": branch,
-    }
-    if file_sha:
-        payload["sha"] = file_sha
-
-    resp = await client.put(url, headers=_gh_headers(), json=payload)
-    resp.raise_for_status()
-    commit_sha = resp.json().get("commit", {}).get("sha", "unknown")
-    log.info("file_updated_via_api", filename=filename, commit=commit_sha[:8])
-    return commit_sha
-
-
 def _apply_unified_diff(original: str, patch: str) -> str:
-    """
-    Minimal unified diff applicator.
-    Handles +/- lines in hunks. Good enough for single-file patches from LLMs.
-    Falls back to appending a comment if parsing fails.
-    """
     try:
         orig_lines = original.splitlines(keepends=True)
-        result_lines = list(orig_lines)  # will be rebuilt
         output: List[str] = []
-        in_hunk = False
-        orig_pos = 0  # 0-indexed into result_lines
+        orig_pos = 0
 
         for line in patch.splitlines(keepends=True):
             if line.startswith("---") or line.startswith("+++"):
                 continue
             if line.startswith("@@"):
-                # Parse @@ -start,count +start,count @@
-                import re
                 m = re.search(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
                 if m:
-                    orig_start = int(m.group(1)) - 1   # 0-indexed
-                    # Flush lines before this hunk
-                    output.extend(result_lines[:orig_start])
+                    orig_start = int(m.group(1)) - 1
+                    output.extend(orig_lines[:orig_start])
                     orig_pos = orig_start
-                in_hunk = True
                 continue
-
-            if not in_hunk:
-                continue
-
             if line.startswith("-"):
-                orig_pos += 1  # skip this original line
+                orig_pos += 1
             elif line.startswith("+"):
                 output.append(line[1:])
             else:
-                # Context line
-                if orig_pos < len(result_lines):
-                    output.append(result_lines[orig_pos])
+                if orig_pos < len(orig_lines):
+                    output.append(orig_lines[orig_pos])
                 orig_pos += 1
 
-        # Append remaining original lines
-        if orig_pos < len(result_lines):
-            output.extend(result_lines[orig_pos:])
+        if orig_pos < len(orig_lines):
+            output.extend(orig_lines[orig_pos:])
 
         return "".join(output)
     except Exception as exc:
@@ -237,39 +169,48 @@ def _apply_unified_diff(original: str, patch: str) -> str:
 
 
 async def _apply_patches(state: Dict[str, Any], patch_diffs: List[str]) -> str:
-    """Apply all patches to the PR branch via GitHub Contents API."""
     owner, repo = state["repo_full_name"].split("/", 1)
     branch = state["head_branch"]
     results = []
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         for i, diff in enumerate(patch_diffs):
-            # Extract filename from diff header
-            import re
             m = re.search(r"^\+\+\+ b?/(.+)$", diff, re.MULTILINE)
             if not m:
-                # Try to get file from patches list
                 patches = state.get("patches", [])
                 filename = patches[i]["file"] if i < len(patches) else "unknown.py"
             else:
                 filename = m.group(1)
 
-            # Get current file content
             url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{filename}"
             resp = await client.get(url, params={"ref": branch}, headers=_gh_headers())
             if resp.status_code == 404:
                 log.warning("patch_file_not_found", filename=filename)
                 continue
             resp.raise_for_status()
-            current_b64 = resp.json().get("content", "")
+
+            data = resp.json()
+            file_sha = data.get("sha")
+            current_b64 = data.get("content", "")
             current_content = base64.b64decode(current_b64).decode("utf-8", errors="replace")
 
+            new_content = _apply_unified_diff(current_content, diff)
+            encoded = base64.b64encode(new_content.encode("utf-8")).decode()
+
+            payload: Dict[str, Any] = {
+                "message": f"fix: auto-patch issue #{i+1} in {filename} [bot]",
+                "content": encoded,
+                "branch": branch,
+            }
+            if file_sha:
+                payload["sha"] = file_sha
+
             try:
-                sha = await _apply_patch_via_contents_api(
-                    client, owner, repo, branch, filename, current_content, diff,
-                    commit_message=f"fix: auto-patch issue #{i+1} in {filename} [bot]",
-                )
-                results.append(f"✓ {filename} → {sha[:8]}")
+                put_url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{filename}"
+                put_resp = await client.put(put_url, headers=_gh_headers(), json=payload)
+                put_resp.raise_for_status()
+                commit_sha = put_resp.json().get("commit", {}).get("sha", "unknown")
+                results.append(f"✓ {filename} → {commit_sha[:8]}")
             except Exception as exc:
                 log.error("patch_apply_error", filename=filename, error=str(exc))
                 results.append(f"✗ {filename}: {exc}")
@@ -277,23 +218,17 @@ async def _apply_patches(state: Dict[str, Any], patch_diffs: List[str]) -> str:
     return "; ".join(results) if results else "no patches applied"
 
 
-# ─── FastAPI sub-application ──────────────────────────────────────────────────
+# FastAPI app
 
 audit_app = FastAPI(title="Code Review Audit API", version="1.0.0")
 
 
-@audit_app.get(
-    "/reviews",
-    response_model=List[PRSummary],
-    dependencies=[Depends(require_auth)],
-)
+@audit_app.get("/reviews", response_model=List[PRSummary], dependencies=[Depends(require_auth)])
 async def list_reviews() -> List[PRSummary]:
-    """List all PRs currently awaiting human review."""
     rows = await _list_awaiting_human()
     summaries: List[PRSummary] = []
     for row in rows:
         s = json.loads(row["state_json"])
-        # Build severity summary
         diags = s.get("llm_diagnostics", [])
         sev = SeveritySummary(
             HIGH=sum(1 for d in diags if d.get("severity", "").upper() == "HIGH"),
@@ -314,12 +249,8 @@ async def list_reviews() -> List[PRSummary]:
     return summaries
 
 
-@audit_app.get(
-    "/reviews/{pr_number}",
-    dependencies=[Depends(require_auth)],
-)
+@audit_app.get("/reviews/{pr_number}", dependencies=[Depends(require_auth)])
 async def get_review(pr_number: int) -> Dict[str, Any]:
-    """Return full PRState for a given PR."""
     state = await _get_pr_state(pr_number)
     if not state:
         raise HTTPException(status_code=404, detail=f"PR #{pr_number} not found")
@@ -332,12 +263,6 @@ async def get_review(pr_number: int) -> Dict[str, Any]:
     dependencies=[Depends(require_auth)],
 )
 async def post_decision(pr_number: int, body: DecisionRequest) -> DecisionResponse:
-    """
-    Accept, modify, or reject a PR review.
-    accept  → apply generated patches via GitHub API
-    modify  → apply reviewer's modified_patch instead
-    reject  → post a PR comment, no code changes
-    """
     state = await _get_pr_state(pr_number)
     if not state:
         raise HTTPException(status_code=404, detail=f"PR #{pr_number} not found")
@@ -356,8 +281,7 @@ async def post_decision(pr_number: int, body: DecisionRequest) -> DecisionRespon
                 await _post_pr_comment(
                     client, owner, repo, pr_number,
                     f"🤖 **Auto-patch applied** by Code Review Bot.\n\n"
-                    f"Reviewer note: {body.reviewer_note or '—'}\n\n"
-                    f"Result: {github_result}",
+                    f"Reviewer note: {body.reviewer_note or '—'}\n\nResult: {github_result}",
                 )
 
         elif body.action == "modify":
@@ -367,21 +291,18 @@ async def post_decision(pr_number: int, body: DecisionRequest) -> DecisionRespon
             await _post_pr_comment(
                 client, owner, repo, pr_number,
                 f"🤖 **Modified patch applied** by reviewer.\n\n"
-                f"Reviewer note: {body.reviewer_note or '—'}\n\n"
-                f"Result: {github_result}",
+                f"Reviewer note: {body.reviewer_note or '—'}\n\nResult: {github_result}",
             )
 
         elif body.action == "reject":
             note = body.reviewer_note or "No additional notes."
             await _post_pr_comment(
                 client, owner, repo, pr_number,
-                f"🤖 **Auto-patch rejected** by reviewer.\n\n"
-                f"Reason: {note}\n\n"
+                f"🤖 **Auto-patch rejected** by reviewer.\n\nReason: {note}\n\n"
                 "No automated changes were applied. Please address the issues manually.",
             )
             github_result = "comment posted, no code changes"
 
-    # Update state with decision and mark resolved
     human_decision = {
         "action": body.action,
         "modified_patch": body.modified_patch,
@@ -393,7 +314,6 @@ async def post_decision(pr_number: int, body: DecisionRequest) -> DecisionRespon
     state["awaiting_human"] = False
     await _mark_resolved(pr_number, state)
 
-    # Resume LangGraph pipeline (fire-and-forget; won't block response)
     try:
         from pipeline import resume_pipeline
         import asyncio
@@ -402,7 +322,6 @@ async def post_decision(pr_number: int, body: DecisionRequest) -> DecisionRespon
         log.warning("pipeline_resume_task_error", error=str(exc))
 
     log.info("decision_recorded", pr_number=pr_number, action=body.action)
-
     return DecisionResponse(
         pr_number=pr_number,
         action=body.action,

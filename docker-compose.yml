@@ -1,0 +1,55 @@
+version: "3.9"
+
+services:
+  #FastAPI: Webhook Listener + Audit API + LangGraph Pipeline
+
+  
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: code-review-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      DB_PATH: /app/data/reviews.db
+    volumes:
+      - db_data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - review_net
+
+  # Streamlit Reviewer Dashboard 
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: code-review-dashboard
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      API_BASE_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - review_net
+
+volumes:
+  db_data:
+    driver: local
+
+networks:
+  review_net:
+    driver: bridge
